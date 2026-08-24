@@ -77,8 +77,21 @@ function HistoryDetail({ row, onClose }) {
       
       {/* LEFT PANE - Dark Green with Image */}
       <div style={{ flex: '0 0 35%', backgroundColor: '#0b1f0d', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '20px', borderRight: '1px solid #1a3a1f' }}>
-         {row.thumbnail ? (
-            <img src={`data:image/jpeg;base64,${row.thumbnail}`} alt="scan" style={{ width: '100%', maxWidth: '200px', borderRadius: '16px', border: '4px solid #1a3a1f', objectFit: 'cover', aspectRatio: '1/1' }}/>
+         {row.image_url || row.thumbnail ? (
+            <img 
+              src={row.image_url ? `http://127.0.0.1:5001${row.image_url}` : `data:image/jpeg;base64,${row.thumbnail}`} 
+              alt="scan" 
+              style={{ 
+                width: '100%', 
+                maxWidth: '200px', 
+                borderRadius: '16px', 
+                border: '4px solid #1a3a1f', 
+                objectFit: 'contain', 
+                backgroundColor: '#051307',
+                aspectRatio: '1/1',
+                padding: '4px'
+              }}
+            />
          ) : (
             <FruitBall size={120}/>
          )}

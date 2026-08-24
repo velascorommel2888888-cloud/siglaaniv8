@@ -1,14 +1,13 @@
 import { useState, useEffect } from 'react';
 import logo from '../logo.png';
 import Topbar from './shared/Topbar';
-// 1. I-import ang apiScan function mula sa iyong api.js file
-import { apiScan } from '../api'; 
+import { apiScan } from '../api';
 
 const PROC_STEPS = [
   "Kinukuha ang larawan",
-  "Sinusuri ang kulay at texture",
-  "Nagpapatakbo ng ML model",
-  "Naghahanda ng resulta...",
+  "Sinusuri ang bawat prutas",
+  "Nagpapatakbo ng AI model",
+  "Naghahanda ng resibo at resulta...",
 ];
 const MILESTONES = [25, 55, 80, 100];
 
@@ -17,68 +16,74 @@ export default function ProcessingScreen({ onComplete }) {
   const [stepIdx,  setStepIdx]  = useState(0);
 
   useEffect(() => {
-    let resultsArray = [];
+    let finalResults = [];
     let apiFinished = false;
 
-    // 2. Gawa ng async function para tawagin ang API ng sunod-sunod para sa bawat prutas
-    const processFruitsData = async () => {
+    const processBatch = async () => {
       try {
         const image = window.__siglaani_captured_image__;
-        const fruits = window.__siglaani_multiple_fruits__ || [];
         
-        // Limitahan sa 4 na prutas max para hindi mag-timeout ang server
-        const scanLimit = Math.min(fruits.length, 4); 
+        // Read the fruits payload created in ScanScreen
+        const fruits = window.__siglaani_fruits_payload__ || [
+          {
+            detected_fruit: window.__siglaani_fruit_name__ || "Unknown",
+            bbox: window.__siglaani_bbox__ || null,
+            model_condition: window.__siglaani_class_condition__ || "ripe",
+            model_confidence: window.__siglaani_model_confidence__ || 85,
+          }
+        ];
 
-        for (let i = 0; i < scanLimit; i++) {
-          const f = fruits[i];
-          const payload = {
-            image: image,
-            detected_fruit: f.hsv_key,
-            bbox: f.bbox
-          };
-          
-          // Tawagin ang backend
-          const res = await apiScan(payload);
-          if (res && res.data) {
-            resultsArray.push(res.data);
+        const payload = {
+          image: image,
+          fruits: fruits,
+          detected_fruit: window.__siglaani_fruit_name__ || "Unknown",
+          bbox: window.__siglaani_bbox__ || null,
+          model_condition: window.__siglaani_class_condition__ || "ripe",
+          model_confidence: window.__siglaani_model_confidence__ || 85,
+        };
+
+        // Send a single batch request to Flask
+        const res = await apiScan(payload);
+
+        if (res && res.data) {
+          // If backend returned a multi-result bundle, use .results
+          if (res.data.results && Array.isArray(res.data.results)) {
+            finalResults = res.data.results;
+          } else {
+            finalResults = [res.data];
           }
         }
       } catch (err) {
-        console.error("Error processing multiple fruits:", err);
+        console.error("Error processing fruit batch:", err);
       } finally {
-        // Sabihin sa loading animation na tapos na ang background network requests
-        apiFinished = true; 
+        apiFinished = true;
       }
     };
 
-    // Patakbuhin agad ang API processing pagkapasok sa screen
-    processFruitsData();
+    processBatch();
 
-    // 3. Loading Animation Loop na may kasamang Network Sync Logic
+    // Loading Animation Sync
     let p = 0, si = 0;
     const iv = setInterval(() => {
-      // Kung umabot na sa 95% pero naglo-load pa sa background ang Pi, i-hold muna ang animation
       if (p >= 95 && !apiFinished) {
-        p = 95; 
+        p = 95;
       } else {
-        p += Math.random() * 4 + 1;
+        p += Math.random() * 5 + 2;
       }
 
       if (p > 100) p = 100;
       setProgress(Math.round(p));
 
-      if (si < MILESTONES.length && p >= MILESTONES[si]) { 
-        si++; 
-        setStepIdx(si); 
+      if (si < MILESTONES.length && p >= MILESTONES[si]) {
+        si++;
+        setStepIdx(si);
       }
 
-      // Kapag 100% na at tapos na ang lahat ng API calls, lumipat sa ResultScreen
-      if (p >= 100 && apiFinished) { 
-        clearInterval(iv); 
-        // Ipapasa ang buong resultsArray sa onComplete prop papuntang ResultScreen
-        setTimeout(() => onComplete(resultsArray), 700); 
+      if (p >= 100 && apiFinished) {
+        clearInterval(iv);
+        setTimeout(() => onComplete(finalResults), 500);
       }
-    }, 60);
+    }, 50);
 
     return () => clearInterval(iv);
   }, [onComplete]);

@@ -10,7 +10,7 @@ export default function DashboardScreen({ onBack }) {
     try {
       // Fetching from the new Python endpoint we just made!
       // The ?t= prevents caching so it's always real-time
-      const res = await fetch(`http://127.0.0.1:5000/api/analytics?t=${Date.now()}`);
+      const res = await fetch(`http://127.0.0.1:5001/api/analytics?t=${Date.now()}`);
       if (!res.ok) throw new Error("Failed to fetch");
       const json = await res.json();
       setData(json);

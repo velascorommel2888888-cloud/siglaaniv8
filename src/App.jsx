@@ -9,8 +9,7 @@ import ResultScreen       from "./components/ResultScreen";
 import HistoryScreen      from "./components/HistoryScreen";
 import DashboardScreen    from "./components/DashboardScreen";
 
-import { apiScan, ScanError }      from "./api";
-import { RECOMMENDATIONS }         from "./constants";
+import { RECOMMENDATIONS } from "./constants";
 
 let scanCounter = 0;
 
@@ -29,30 +28,24 @@ function scoreFromFreshness(condition) {
 }
 
 function applyFruitIdentity(result) {
-  const fruitName      = window.__siglaani_fruit_name__       ?? null;
-  const scientific     = window.__siglaani_scientific__       ?? null;
-  const modelCondition = window.__siglaani_class_condition__  ?? null;
-  const capturedImg    = window.__siglaani_captured_image__   ?? null;
+  const fruitName      = window.__siglaani_fruit_name__ || result.fruit || "Apple";
+  const scientific     = window.__siglaani_scientific__ || "SIGLA ANI AI";
+  const modelCondition = window.__siglaani_class_condition__ || result.condition || "ripe";
+  const capturedImage  = window.__siglaani_captured_image__ || result.image || null;
 
-  if (fruitName)  result.fruit      = fruitName;
-  if (scientific) result.scientific = scientific;
-  if (modelCondition) result.condition = modelCondition;
-  if (capturedImg) result.image     = capturedImg; // <--- Passes captured image to ResultScreen!
+  result.fruit          = fruitName;
+  result.scientific     = scientific;
+  result.condition      = modelCondition;
+  result.conditionLabel = CONDITION_LABELS[modelCondition] || "Hinog (Ripe)";
+  result.rating         = scoreFromFreshness(modelCondition);
+  result.image          = capturedImage;
 
-  if (result.condition) {
-    result.conditionLabel = CONDITION_LABELS[result.condition] ?? result.condition;
-    result.rating         = scoreFromFreshness(result.condition);
+  const baseReco = RECOMMENDATIONS[modelCondition] || "";
+  const prefix = modelCondition === "ripe"
+    ? `${fruitName} looks fresh. `
+    : `${fruitName} looks not fresh. `;
+  result.recommendation = `${prefix}${baseReco}`;
 
-    const baseReco = RECOMMENDATIONS[result.condition] ?? result.recommendation;
-    if (fruitName) {
-      const prefix = result.condition === "ripe"
-        ? `${fruitName} looks fresh. `
-        : `${fruitName} looks not fresh. `;
-      result.recommendation = `${prefix}${baseReco}`;
-    } else {
-      result.recommendation = baseReco;
-    }
-  }
   return result;
 }
 
@@ -65,6 +58,7 @@ function clearSessionData() {
   delete window.__siglaani_hsv_key__;
   delete window.__siglaani_class_condition__;
   delete window.__siglaani_bbox__;
+  delete window.__siglaani_fruits_payload__;
 }
 
 export default function App() {
@@ -124,65 +118,40 @@ export default function App() {
     };
   }, [screen, handleInactivityTimeout]);
 
-  const handleProcessingComplete = useCallback(async () => {
+  const handleProcessingComplete = useCallback((processedResults) => {
     scanCounter++;
 
-    try {
-      const imagePayload = window.__siglaani_captured_image__ || null;
+    // Accept batch results directly from ProcessingScreen
+    if (processedResults && (Array.isArray(processedResults) ? processedResults.length > 0 : processedResults.results)) {
+      const finalArray = Array.isArray(processedResults) 
+        ? processedResults 
+        : (processedResults.results || [processedResults]);
 
-      const payload = {
-        image:            imagePayload,
-        detected_fruit:   window.__siglaani_fruit_name__,
-        hsv_key:          window.__siglaani_hsv_key__,
-        bbox:             window.__siglaani_bbox__ || null,
-        model_condition:  window.__siglaani_class_condition__,
-        model_confidence: window.__siglaani_model_confidence__ || 90,
-      };
-
-      const data = await apiScan(payload);
-      setResult(applyFruitIdentity({ ...data }));
-      setScanId(data.id);
+      setResult(finalArray);
+      setScanId(finalArray[0]?.transaction_id || finalArray[0]?.id || scanCounter);
       go("result");
-    } catch (err) {
-      // ── Backend rejected the scan because no fruit was visible ───────────
-      // Don't fall through to a fake result — bounce the user back to the
-      // scan screen with a friendly message.
-      if (err instanceof ScanError &&
-          (err.code === "no_fruit_detected" || err.code === "background_only")) {
-        console.warn("[SiglaAni] No fruit detected:", err.userMessage);
-        clearSessionData();
-        // Use a small timeout so the alert appears AFTER React paints scan screen
-        go("scan");
-        setTimeout(() => {
-          window.alert(err.userMessage ||
-            "Walang prutas na nakita. Ilagay ang prutas sa harap ng camera at i-scan muli.");
-        }, 50);
-        return;
-      }
-
-      // ── Real network error → use offline fallback ────────────────────────
-      console.warn("[SiglaAni] Backend unavailable, using local fallback:", err);
-      const fruitName    = window.__siglaani_fruit_name__ ?? "Hindi Matukoy";
-      const scientific   = window.__siglaani_scientific__ ?? "—";
-      const fallbackCond = "ripe";
-
-      setResult({
-        fruit:          fruitName,
-        scientific:     scientific,
-        condition:      fallbackCond,
-        conditionLabel: CONDITION_LABELS[fallbackCond],
-        confidence:     75,
-        rating:         4,
-        recommendation: RECOMMENDATIONS[fallbackCond],
-        id:             scanCounter,
-        xai: {
-          available: false,
-          notice:    "Hindi maipakita ang AI explanation habang offline ang server.",
-        },
-      });
-      setScanId(scanCounter);
-      go("result");
+      return;
     }
+
+    // Offline / single fruit fallback
+    const fruitName      = window.__siglaani_fruit_name__ || "Apple";
+    const modelCondition = window.__siglaani_class_condition__ || "ripe";
+    const imagePayload   = window.__siglaani_captured_image__ || null;
+
+    const fallbackResult = applyFruitIdentity({
+      fruit:          fruitName,
+      scientific:     "SIGLA ANI AI",
+      condition:      modelCondition,
+      confidence:     85,
+      rating:         scoreFromFreshness(modelCondition),
+      id:             scanCounter,
+      image:          imagePayload,
+      xai: { available: false, notice: "Offline mode" }
+    });
+
+    setResult([fallbackResult]);
+    setScanId(scanCounter);
+    go("result");
   }, [go]);
 
   const handleHome = useCallback(() => {

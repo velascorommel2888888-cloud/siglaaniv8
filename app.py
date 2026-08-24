@@ -1,19 +1,21 @@
 """
 SiglaAni — Flask Backend
-- Accepts captured image + bbox from frontend
+- Accepts captured image + bounding boxes from frontend
+- Supports simultaneous multi-fruit scanning with individual cropping
 - Prioritizes client-side Teachable Machine condition predictions
 - Fallback fruit-specific HSV heuristics if no model prediction is supplied
-- REQ-14: Persists every capture with a timestamped filename
+- REQ-14: Persists every capture and crop with timestamped filenames
 - REQ-32..37: Generates a Grad-CAM-style saliency overlay (Explainable AI)
-              localized to the bbox region. Logged to SQLite for auditability.
-- Mobile Reader API: Exposes GET /api/scan/<scan_id> for the mobile viewer app.
+              localized to each bbox region. Logged to SQLite for auditability.
+- Multi-Item Digital Receipt API: Exposes GET /api/receipt/<transaction_id>
+- Mobile Reader API: Exposes GET /api/scan/<scan_id>
 """
 
 import os, sqlite3, base64
 from datetime import datetime
 import numpy as np
 import cv2
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -49,30 +51,46 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scans (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            fruit           TEXT    NOT NULL DEFAULT 'Unknown',
-            scientific      TEXT    DEFAULT '',
-            condition       TEXT    NOT NULL DEFAULT 'ripe',
-            condition_label TEXT    DEFAULT '',
-            confidence      REAL    DEFAULT 0,
-            rating          INTEGER DEFAULT 3,
-            recommendation  TEXT    DEFAULT '',
-            temp            REAL    DEFAULT 0,
-            thumbnail       TEXT    DEFAULT '',
-            scanned_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            fruit            TEXT    NOT NULL DEFAULT 'Unknown',
+            scientific       TEXT    DEFAULT '',
+            condition        TEXT    NOT NULL DEFAULT 'ripe',
+            condition_label  TEXT    DEFAULT '',
+            confidence       REAL    DEFAULT 0,
+            rating           INTEGER DEFAULT 3,
+            recommendation   TEXT    DEFAULT '',
+            temp             REAL    DEFAULT 0,
+            thumbnail        TEXT    DEFAULT '',
+            scanned_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             capture_filename TEXT   DEFAULT '',
             xai_filename     TEXT   DEFAULT '',
             xai_coverage     REAL   DEFAULT 0,
             xai_explanation  TEXT   DEFAULT '',
-            xai_generated    INTEGER DEFAULT 0
+            xai_generated    INTEGER DEFAULT 0,
+            transaction_id   TEXT    DEFAULT NULL,
+            is_purchased     INTEGER DEFAULT 0
         )
     """)
+    
+    # Transactions / Digital Receipts Table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            transaction_id   TEXT PRIMARY KEY,
+            vendor_name      TEXT DEFAULT 'Sigla Ani Kiosk - Valenzuela',
+            total_amount     REAL DEFAULT 0.0,
+            total_items      INTEGER DEFAULT 0,
+            purchased_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     new_cols = [
         ("capture_filename", "TEXT DEFAULT ''"),
         ("xai_filename",     "TEXT DEFAULT ''"),
         ("xai_coverage",     "REAL DEFAULT 0"),
         ("xai_explanation",  "TEXT DEFAULT ''"),
         ("xai_generated",    "INTEGER DEFAULT 0"),
+        ("transaction_id",   "TEXT DEFAULT NULL"),
+        ("is_purchased",     "INTEGER DEFAULT 0")
     ]
     for col, decl in new_cols:
         try:
@@ -92,8 +110,8 @@ def save_scan(data: dict) -> int:
               (fruit, scientific, condition, condition_label,
                confidence, rating, recommendation, temp, thumbnail,
                capture_filename, xai_filename, xai_coverage,
-               xai_explanation, xai_generated)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               xai_explanation, xai_generated, transaction_id, is_purchased)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             str(data.get("fruit",            "Unknown")),
             str(data.get("scientific",       "")),
@@ -109,6 +127,8 @@ def save_scan(data: dict) -> int:
             float(data.get("xai_coverage",   0)),
             str(data.get("xai_explanation",  "")),
             int(data.get("xai_generated",    0)),
+            data.get("transaction_id",       None),
+            int(data.get("is_purchased",     0)),
         ))
         conn.commit()
         new_id = cur.lastrowid
@@ -156,6 +176,14 @@ def save_capture_image(frame) -> str:
     print(f"[SiglaAni] Saved capture → {filepath}")
     return filename
 
+def save_crop_image(crop_frame, prefix="crop") -> str:
+    """Saves a cropped sub-image for an individually analyzed fruit."""
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S_") + f"{datetime.now().microsecond // 1000:03d}"
+    filename = f"{prefix}_{ts}.jpg"
+    filepath = os.path.join(CAPTURE_DIR, filename)
+    cv2.imwrite(filepath, crop_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return filename
+
 # ── Fruit metadata ─────────────────────────────────────────────────────────────
 CONDITION_LABELS = {
     "ripe":     "Hinog (Ripe)",
@@ -189,7 +217,7 @@ def condition_to_rating(condition: str, confidence: int) -> int:
     return 1
 
 # ── Cropping & content validation ────────────────────────────────────────────
-def get_analysis_region(frame, bbox=None, padding=0.05):
+def get_analysis_region(frame, bbox=None, padding=0.25):
     h, w = frame.shape[:2]
 
     if bbox and len(bbox) == 4:
@@ -208,7 +236,7 @@ def get_analysis_region(frame, bbox=None, padding=0.05):
             pass
 
     cy, cx = h // 2, w // 2
-    ch, cw = max(1, int(h * 0.40) // 2), max(1, int(w * 0.40) // 2)
+    ch, cw = max(1, int(h * 0.45) // 2), max(1, int(w * 0.45) // 2)
     return frame[cy - ch:cy + ch, cx - cw:cx + cw], (cx - cw, cy - ch, cx + cw, cy + ch)
 
 def has_fruit_content(crop) -> bool:
@@ -399,120 +427,207 @@ def health():
         "xai":    "hsv-saliency",
     })
 
+# ── Multi-Fruit Simultaneous Scan Endpoint ───────────────────────────────────
 @app.route("/api/scan", methods=["POST"])
 def scan():
-    body           = request.get_json(silent=True) or {}
-    detected_fruit = body.get("hsv_key") or body.get("detected_fruit") or None
-    image_b64      = body.get("image") or None
-    bbox           = body.get("bbox") or None
+    body = request.get_json(silent=True) or {}
+    image_b64 = body.get("image") or None
 
-    # Teachable Machine prediction passed from React frontend
-    model_condition  = body.get("model_condition")
-    model_confidence = body.get("model_confidence", 85)
-
-    print(f"[SiglaAni] /api/scan — fruit={detected_fruit!r}, "
-          f"model_cond={model_condition!r}, bbox={bbox}, image={'yes' if image_b64 else 'no'}")
-
-    if not detected_fruit and not model_condition:
+    if not image_b64:
         return jsonify({
-            "error":   "no_fruit_detected",
-            "message": "Walang prutas na nakita. Ilagay ang prutas sa harap ng camera bago mag-scan.",
+            "error": "no_fruit_detected",
+            "message": "Walang prutas na nakita. Ilagay ang prutas sa harap ng camera bago mag-scan."
         }), 400
 
-    if image_b64:
-        try:
-            frame = decode_image(image_b64)
-        except Exception as e:
-            return jsonify({"error": "decode_failed", "message": f"Image decode failed: {e}"}), 400
-    else:
-        try:
-            cap = cv2.VideoCapture(0)
-            for _ in range(5): cap.read()
-            ret, frame = cap.read()
-            cap.release()
-            if not ret:
-                return jsonify({"error": "camera_failed", "message": "Camera could not capture."}), 500
-        except Exception as e:
-            return jsonify({"error": "camera_failed", "message": f"Camera error: {e}"}), 500
-
-    crop, crop_rect = get_analysis_region(frame, bbox)
-
-    # ── PURE TEACHABLE MACHINE PRIORITY ──────────────────────────────────────
-    if model_condition:
-        condition  = model_condition
-        confidence = int(model_confidence)
-        fruit_name = body.get("detected_fruit") or "Unknown"
-        
-        result = {
-            "fruit":          fruit_name,
-            "scientific":     COCO_TO_FRUIT.get((body.get("hsv_key") or "").lower(), ("Unknown", "—"))[1],
-            "condition":      condition,
-            "conditionLabel": CONDITION_LABELS.get(condition, condition),
-            "confidence":     confidence,
-            "rating":         condition_to_rating(condition, confidence),
-            "recommendation": RECOMMENDATIONS.get(condition, ""),
-        }
-    else:
-        # Fallback to HSV heuristics only if model prediction is missing
-        if not has_fruit_content(crop):
-            return jsonify({
-                "error":   "background_only",
-                "message": "Hindi maliwanag na nakita ang prutas. Ilapit nang konti at i-scan muli.",
-            }), 400
-        try:
-            result = analyse_crop(crop, detected_fruit)
-        except Exception as e:
-            return jsonify({"error": "analysis_failed", "message": f"Analysis error: {e}"}), 500
-
-    result["temp"]      = get_cpu_temp()
-    result["thumbnail"] = make_thumbnail(frame)
-
     try:
-        result["capture_filename"] = save_capture_image(frame)
+        frame = decode_image(image_b64)
     except Exception as e:
-        print(f"[SiglaAni] Capture save failed: {e}")
-        result["capture_filename"] = ""
+        return jsonify({"error": "decode_failed", "message": f"Image decode failed: {e}"}), 400
 
-    fruit_key = (detected_fruit or "").lower().strip()
+    # Read multi-fruit list or build single-item list
+    fruits_list = body.get("fruits")
+    if not fruits_list or not isinstance(fruits_list, list):
+        fruits_list = [{
+            "detected_fruit":   body.get("hsv_key") or body.get("detected_fruit") or None,
+            "bbox":             body.get("bbox") or None,
+            "model_condition":  body.get("model_condition"),
+            "model_confidence": body.get("model_confidence", 85)
+        }]
+
+    # Filter out empty entries
+    valid_fruits = [f for f in fruits_list if f.get("detected_fruit") or f.get("model_condition")]
+    if not valid_fruits:
+        return jsonify({
+            "error": "no_fruit_detected",
+            "message": "Walang prutas na nakita. Ilagay ang prutas sa harap ng camera bago mag-scan."
+        }), 400
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    transaction_id = f"TXN_{ts}"
+    analyzed_results = []
+
+    for idx, item in enumerate(valid_fruits):
+        bbox             = item.get("bbox")
+        model_condition  = item.get("model_condition")
+        model_confidence = item.get("model_confidence", 85)
+        detected_fruit   = item.get("detected_fruit") or "Unknown"
+
+        crop, crop_rect = get_analysis_region(frame, bbox)
+
+        if model_condition:
+            condition  = str(model_condition).lower()
+            confidence = int(model_confidence)
+            fruit_name = str(detected_fruit).strip().capitalize()
+            
+            result = {
+                "fruit":          fruit_name,
+                "scientific":     COCO_TO_FRUIT.get(fruit_name.lower(), ("—", "SIGLA ANI AI"))[1],
+                "condition":      condition,
+                "conditionLabel": CONDITION_LABELS.get(condition, condition),
+                "confidence":     confidence,
+                "rating":         condition_to_rating(condition, confidence),
+                "recommendation": RECOMMENDATIONS.get(condition, ""),
+            }
+        else:
+            try:
+                result = analyse_crop(crop, detected_fruit)
+            except Exception as e:
+                fruit_name = str(detected_fruit).strip().capitalize()
+                result = {
+                    "fruit":          fruit_name,
+                    "scientific":     "SIGLA ANI AI",
+                    "condition":      "ripe",
+                    "conditionLabel": "Hinog (Ripe)",
+                    "confidence":     75,
+                    "rating":         3,
+                    "recommendation": RECOMMENDATIONS.get("ripe", ""),
+                }
+
+        result["temp"]      = get_cpu_temp()
+        result["thumbnail"] = make_thumbnail(crop)
+
+        # Save individual crop
+        fruit_tag = (result.get("fruit") or "fruit").lower()
+        crop_filename = save_crop_image(crop, prefix=f"crop_{fruit_tag}_{idx+1}")
+        result["capture_filename"] = crop_filename
+        result["transaction_id"]   = transaction_id
+        result["is_purchased"]     = 0
+
+        # Run XAI
+        fruit_key = (detected_fruit or result.get("fruit") or "").lower().strip()
+        try:
+            overlay_b64, xai_meta = generate_xai_overlay(
+                frame, crop_rect, result["condition"], fruit_key, int(result["confidence"])
+            )
+        except Exception as e:
+            print(f"[SiglaAni] XAI error: {e}")
+            overlay_b64, xai_meta = None, None
+
+        if overlay_b64 and xai_meta:
+            result["xai"] = {
+                "available":   True,
+                "overlay":     overlay_b64,
+                "filename":    xai_meta["filename"],
+                "coverage":    xai_meta["coverage"],
+                "explanation": xai_meta["explanation"],
+            }
+            result["xai_filename"]    = xai_meta["filename"]
+            result["xai_coverage"]    = xai_meta["coverage"]
+            result["xai_explanation"] = xai_meta["explanation"]
+            result["xai_generated"]   = 1
+        else:
+            result["xai"] = {
+                "available": False,
+                "notice":    "Walang available na paliwanag para sa scan na ito.",
+            }
+            result["xai_filename"]    = ""
+            result["xai_coverage"]    = 0
+            result["xai_explanation"] = ""
+            result["xai_generated"]   = 0
+
+        try:
+            new_id = save_scan(result)
+            result["id"] = new_id
+            result["scan_id"] = new_id
+            result["image_url"] = f"/captures/{crop_filename}"
+        except Exception as e:
+            print(f"[SiglaAni] WARNING: DB save failed — {e}")
+            result["id"] = 0
+
+        analyzed_results.append(result)
+
+    if not analyzed_results:
+        return jsonify({
+            "error": "background_only",
+            "message": "Hindi maliwanag na nakita ang prutas. Ilapit nang konti at i-scan muli."
+        }), 400
+
+    # Record batch transaction
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items)
+        VALUES (?, ?, ?, ?)
+    """, (transaction_id, "Sigla Ani Kiosk - Valenzuela", len(analyzed_results) * 20.0, len(analyzed_results)))
+    conn.commit()
+    conn.close()
+
+    # If only 1 fruit was detected, return flat dictionary for backwards compatibility
+    if len(analyzed_results) == 1:
+        single = analyzed_results[0]
+        single["transaction_id"] = transaction_id
+        return jsonify(single), 200
+
+    # If multiple fruits detected, return multi-card carousel bundle
+    return jsonify({
+        "success":        True,
+        "transaction_id": transaction_id,
+        "total_count":    len(analyzed_results),
+        "results":        analyzed_results
+    }), 200
+
+# ── Static File Serving for Mobile App ────────────────────────────────────────
+@app.route("/captures/<path:filename>")
+def serve_capture(filename):
+    return send_from_directory(CAPTURE_DIR, filename)
+
+@app.route("/xai_overlays/<path:filename>")
+def serve_xai(filename):
+    return send_from_directory(XAI_DIR, filename)
+
+# ── Multi-Item Receipt Endpoint ──────────────────────────────────────────────
+@app.route("/api/receipt/<string:transaction_id>", methods=["GET"])
+def get_receipt(transaction_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
     try:
-        overlay_b64, xai_meta = generate_xai_overlay(
-            frame, crop_rect, result["condition"], fruit_key, int(result["confidence"])
-        )
-    except Exception as e:
-        print(f"[SiglaAni] XAI generation crashed: {e}")
-        overlay_b64, xai_meta = None, None
+        txn = conn.execute("SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,)).fetchone()
+        if not txn:
+            return jsonify({"error": "not_found", "message": "Receipt not found."}), 404
 
-    if overlay_b64 and xai_meta:
-        result["xai"] = {
-            "available":   True,
-            "overlay":     overlay_b64,
-            "filename":    xai_meta["filename"],
-            "coverage":    xai_meta["coverage"],
-            "explanation": xai_meta["explanation"],
-        }
-        result["xai_filename"]    = xai_meta["filename"]
-        result["xai_coverage"]    = xai_meta["coverage"]
-        result["xai_explanation"] = xai_meta["explanation"]
-        result["xai_generated"]   = 1
-    else:
-        result["xai"] = {
-            "available": False,
-            "notice":    "Walang available na paliwanag para sa scan na ito.",
-        }
-        result["xai_filename"]    = ""
-        result["xai_coverage"]    = 0
-        result["xai_explanation"] = ""
-        result["xai_generated"]   = 0
+        scans = conn.execute("SELECT * FROM scans WHERE transaction_id = ? ORDER BY id ASC", (transaction_id,)).fetchall()
+        items = []
+        for s in scans:
+            row = dict(s)
+            filename = row.get("capture_filename") or ""
+            items.append({
+                "scan_id":        row["id"],
+                "fruit_type":     row["fruit"],
+                "scientific":     row["scientific"],
+                "status":         row["condition_label"] or CONDITION_LABELS.get(row["condition"], row["condition"]),
+                "confidence":     row["confidence"],
+                "rating":         row["rating"],
+                "recommendation": row["recommendation"],
+                "image_url":      f"/captures/{os.path.basename(filename)}" if filename else None
+            })
 
-    try:
-        result["id"] = save_scan(result)
-    except Exception as e:
-        print(f"[SiglaAni] WARNING: DB save failed — {e}")
-        result["id"] = 0
+        receipt_data = dict(txn)
+        receipt_data["items"] = items
+        return jsonify(receipt_data), 200
+    finally:
+        conn.close()
 
-    return jsonify(result), 200
-
-# ── Mobile Reader Endpoint ───────────────────────────────────────────────────
+# ── Single Mobile Reader Endpoint ────────────────────────────────────────────
 @app.route("/api/scan/<int:scan_id>", methods=["GET"])
 def get_scan_by_id(scan_id):
     conn = sqlite3.connect(DB_PATH, timeout=15)
@@ -523,6 +638,9 @@ def get_scan_by_id(scan_id):
             return jsonify({"error": "not_found", "message": "Scan result not found"}), 404
         
         data = dict(row)
+        filename = data.get("capture_filename") or data.get("xai_filename") or ""
+        image_url = f"/captures/{os.path.basename(filename)}" if filename else None
+
         return jsonify({
             "scan_id":        data["id"],
             "fruit_type":     data["fruit"],
@@ -532,7 +650,8 @@ def get_scan_by_id(scan_id):
             "rating":         data["rating"],
             "recommendation": data["recommendation"],
             "timestamp":      data["scanned_at"],
-            "image_url":      None
+            "image_url":      image_url,
+            "transaction_id": data.get("transaction_id")
         }), 200
     except Exception as e:
         print(f"[SiglaAni] Error fetching scan #{scan_id}: {e}")
@@ -606,7 +725,7 @@ def get_analytics():
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
-    print("[SiglaAni] Mode: Teachable Machine Priority")
+    print("[SiglaAni] Mode: Multi-Crop Multi-Fruit Enabled")
     print(f"[SiglaAni] Captures dir → {CAPTURE_DIR}")
     print(f"[SiglaAni] XAI dir      → {XAI_DIR}")
     app.run(host="0.0.0.0", port=5001, debug=True)
